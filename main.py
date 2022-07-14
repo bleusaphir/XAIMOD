@@ -4,6 +4,9 @@ import tensorflow as tf
 import tensorflow.keras as keras
 import utils
 import os
+import PIL
+import matplotlib.pyplot as plt
+import numpy as np
 # print("Welcome. Select your Folder : ")
 # dataFolder = askdirectory(title='Dossier de donnees') # shows dialog box and return the path
 # input(f"Dossier de donnees : {dataFolder}?")  
@@ -13,11 +16,12 @@ import os
 model = tf.keras.applications.vgg16.VGG16(weights="imagenet", include_top=True)
 
 #utils.layer_wise_relevance_propagation()  #Test LRP
-
+print("Yo j'suis là")
 def testOcc(model):
     # Load the original image
-    img = keras.preprocessing.image.load_img(r'C:\Users\jyann\XAIMOD\src\data\A_1329_1.LEFT_CC.png')
+    img = keras.preprocessing.image.load_img('Cancer_preprocessed/0.jpg')
     img = keras.preprocessing.image.img_to_array(img)
+
     patch_size = 4
     output = utils.get_sensitivity_map(
         model=model, image=img, class_index=0, patch_size=patch_size
@@ -25,5 +29,18 @@ def testOcc(model):
 
     utils.save(output, output_dir="results/", output_name='test1.png')
 
-testOcc(model)
+
+#testOcc(model)
+
+def testLime(model):
+  from skimage.segmentation import mark_boundaries
+  explainer = utils.LimeImageExplainer()
+  img = PIL.Image.open('Cancer_preprocessed/0.jpg')
+  img = np.array(img)
+  ret = explainer.explain_instance(img, model)
+  temp, mask = ret.get_image_and_mask(1, positive_only=True, num_features=10, hide_rest=False)
+  plt.imshow(mark_boundaries(temp, mask))
+  
+
 #%%
+testLime(model)
