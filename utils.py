@@ -9,7 +9,7 @@ from IPython.display import Image, display
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import os
-#from lrp import RelevancePropagation
+from lrp import RelevancePropagation
 import tools
 
 
@@ -249,6 +249,7 @@ def explain(
     return grid
 
 def get_sensitivity_map(model, image, class_index, patch_size):
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     """
     Compute sensitivity map on a given image for a specific class index.
 
@@ -427,7 +428,7 @@ class LimeImageExplainer(object):
 
     def explain_instance(self, image, classifier_fn, labels=(1,),
                          hide_color=None,
-                         top_labels=None, num_features=100000, num_samples=1000,
+                         top_labels=None, num_features=100000, num_samples=200,
                          batch_size=10,
                          segmentation_fn=None,
                          distance_metric='cosine',

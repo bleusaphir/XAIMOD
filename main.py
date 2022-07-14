@@ -13,13 +13,13 @@ import numpy as np
 
 # destinationFolder = askdirectory(title='Dossier de destination')
 # input(f"Dossier de destination : {destinationFolder}")
-model = tf.keras.applications.vgg16.VGG16(weights="imagenet", include_top=True)
+model = keras.models.load_model('models/Last.h5')
 
 #utils.layer_wise_relevance_propagation()  #Test LRP
 print("Yo j'suis là")
 def testOcc(model):
     # Load the original image
-    img = keras.preprocessing.image.load_img('Cancer_preprocessed/0.jpg')
+    img = keras.preprocessing.image.load_img('test/0.jpg')
     img = keras.preprocessing.image.img_to_array(img)
 
     patch_size = 4
@@ -32,13 +32,16 @@ def testOcc(model):
 
 #testOcc(model)
 
+
+
+
 def testLime(model):
   from skimage.segmentation import mark_boundaries
   explainer = utils.LimeImageExplainer()
-  img = PIL.Image.open('Cancer_preprocessed/0.jpg')
+  img = PIL.Image.open('test/cancer/6.jpg')
   img = np.array(img)
   ret = explainer.explain_instance(img, model)
-  temp, mask = ret.get_image_and_mask(1, positive_only=True, num_features=10, hide_rest=False)
+  temp, mask = ret.get_image_and_mask(1, positive_only=False, num_features=10, hide_rest=False, min_weight=0.)
   plt.imshow(mark_boundaries(temp, mask))
   
 
