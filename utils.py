@@ -1,4 +1,5 @@
 import math
+from tensorflow.compat.v1.nn import conv2d_backprop_input
 import cv2
 import numpy as np
 import tensorflow as tf
@@ -9,7 +10,6 @@ from IPython.display import Image, display
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import os
-from lrp import RelevancePropagation
 import tools
 
 
@@ -17,7 +17,7 @@ from tools.display import grid_display, heatmap_display
 from tools.image import apply_grey_patch
 from tools.saver import save_rgb
 
-
+from tensorflow.python.ops        import gen_nn_ops
 import copy
 from functools import partial
 import matplotlib.pyplot as plt
@@ -26,90 +26,124 @@ from sklearn.metrics import pairwise_distances
 from sklearn.utils import check_random_state
 from skimage.color import gray2rgb
 from tqdm.auto import tqdm  
-
-
+from tensorflow.keras                        import backend as K
+from tools.lrp_utils                        import (get_model_params, 
+                                          get_gammas, 
+                                          get_heatmaps, infer_target_layer, 
+                                          load_images,
+                                          predict_labels, 
+                                          visualize_heatmap)
 from tools import lime_base
 from skimage import segmentation
+from tensorflow.keras.applications.vgg19 import VGG19 
 
 # -------  Début Partie LRP    ------ #
 
-class LRP():
-
-    def __init__(self, input_path, output_path, size) :
-        self.input_path = input_path
-        self.output_path = output_path
-        self.size = size #224x224x3 images
-
-    def plot_relevance_map(self, image, relevance_map, i):
-        """Plots original image next to corresponding relevance map.
-
-        Args:
-            image: original image
-            relevance_map: relevance map of original image
-            res_dir: path to directory where results are stored
-            i: counter
-        """
-        fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(4, 2))
-        image = image.eval(session=tf.compat.v1.Session())
-        axes[0].imshow(image / 255.0)
-        axes[1].imshow(relevance_map, cmap="afmhot")
-        for ax in axes:
-            ax.set_axis_off()
-        plt.tight_layout()
-        file_path = "{}{}{}".format(self.output_path, i, ".png")
-        plt.savefig(file_path, dpi=120)
-        plt.close(fig)
-
-
-    def layer_wise_relevance_propagation(self, conf=None):
-        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Bug avec CUDA : tf-GPU marche pas pour l'instant
-        #if conf is None:
-            #conf = yaml.safe_load(open("config.yml"))
-        #img_dir = conf["paths"]["image_dir"]
-
-
-        lrp = RelevancePropagation(conf)
-
-        image_paths = list()
-        for (dirpath, dirnames, filenames) in os.walk(self.input_path):
-            image_paths += [os.path.join(dirpath, file) for file in filenames]
-        import PIL.Image
-        for i, image_path in enumerate(image_paths):
-            print("Processing image {}".format(i + 1))
-            image = self.center_crop(np.array(PIL.Image.open(image_path).convert('RGB')), self.size[0], self.size[1])
-            relevance_map = lrp.run(image)
-            self.plot_relevance_map(image, relevance_map, self.output_path, i)
-
-
-    def center_crop(self, image):
-        """Crops largest central region of image.
-
-        Args:
-            image: array of shape (W, H, C)
-            image_height: target height of image
-            image_width: target width of image
-
-        Returns:
-            Cropped image
-
-        Raises:
-            Error if image is not of type RGB.
-        """
-
-        if (len(image.shape) == 2) or (len(image.shape) == 3 and image.shape[-1] == 1):
-            raise Exception("Error: Image must be of type RGB.")
-
-        h, w = image.shape[0], image.shape[1]
-
-        if h > w:
-            cropped_image = tf.image.crop_to_bounding_box(image, (h - w) // 2, 0, w, w)
-        else:
-            cropped_image = tf.image.crop_to_bounding_box(image, 0, (w - h) // 2, h, h)
-
-        return tf.image.resize(cropped_image, (self.size[0], self.size[1]))
-
-
 # -------  Fin Partie LRP    ------ #
+class LayerwiseRelevancePropagation:
+
+  def __init__(self,img_dir, results_dir, model = None, model_name='vgg19', alpha=2, epsilon=1e-7):
+
+    if model is None:
+      model_name = model_name.lower()
+      if model_name == 'vgg16':
+        model_type = VGG16
+      elif model_name == 'vgg19':
+        model_type = VGG19
+      else:
+        raise 'Model name not one of VGG16 or VGG19'
+        sys.exit()
+      self.model = model_type(include_top=True, weights='imagenet', input_shape=(224, 224, 3))
+    else:
+      self.model = model
+    self.alpha = alpha
+    self.beta = 1 - alpha
+    self.epsilon = epsilon
+
+    self.names, self.activations, self.weights = get_model_params(self.model)
+    self.num_layers = len(self.names)
+
+    self.relevance = self.compute_relevances()
+    self.lrp_runner = K.function(inputs=[self.model.input, ], outputs=[self.relevance, ])
+
+  def compute_relevances(self):
+    r = self.model.output
+    for i in range(self.num_layers-2, -1, -1):
+      if 'fc' in self.names[i + 1]:
+        r = self.backprop_fc(self.weights[i + 1][0], self.weights[i + 1][1], self.activations[i], r)
+      elif 'flatten' in self.names[i + 1]:
+        r = self.backprop_flatten(self.activations[i], r)
+      elif 'pool' in self.names[i + 1]:
+        r = self.backprop_max_pool2d(self.activations[i], r)
+      elif 'conv' in self.names[i + 1]:
+        r = self.backprop_conv2d(self.weights[i + 1][0], self.weights[i + 1][1], self.activations[i], r)
+      else:
+        raise 'Layer not recognized!'
+        sys.exit()
+    return r
+
+  def backprop_fc(self, w, b, a, r):
+    w_p = K.maximum(w, 0.)
+    b_p = K.maximum(b, 0.)
+    z_p = K.dot(a, w_p) + b_p + self.epsilon
+    s_p = r / z_p
+    c_p = K.dot(s_p, K.transpose(w_p))
+    
+    w_n = K.minimum(w, 0.)
+    b_n = K.minimum(b, 0.)
+    z_n = K.dot(a, w_n) + b_n - self.epsilon
+    s_n = r / z_n
+    c_n = K.dot(s_n, K.transpose(w_n))
+
+    return a * (self.alpha * c_p + self.beta * c_n)
+
+  def backprop_flatten(self, a, r):
+    shape = a.get_shape().as_list()
+    shape[0] = -1
+    return K.reshape(r, shape)
+
+  def backprop_max_pool2d(self, a, r, ksize=(1, 2, 2, 1), strides=(1, 2, 2, 1)):
+    z = K.pool2d(a, pool_size=ksize[1:-1], strides=strides[1:-1], padding='valid', pool_mode='max')
+
+    z_p = K.maximum(z, 0.) + self.epsilon
+    s_p = r / z_p
+    c_p = gen_nn_ops.max_pool_grad_v2(a, z_p, s_p, ksize, strides, padding='VALID')
+
+    z_n = K.minimum(z, 0.) - self.epsilon
+    s_n = r / z_n
+    c_n = gen_nn_ops.max_pool_grad_v2(a, z_n, s_n, ksize, strides, padding='VALID')
+
+    return a * (self.alpha * c_p + self.beta * c_n)
+
+  def backprop_conv2d(self, w, b, a, r, strides=(1, 1, 1, 1)):
+    w_p = K.maximum(w, 0.)
+    b_p = K.maximum(b, 0.)
+    z_p = K.conv2d(a, kernel=w_p, strides=strides[1:-1], padding='same') + b_p + self.epsilon
+    s_p = r / z_p
+    c_p = conv2d_backprop_input(K.shape(a), w_p, s_p, strides, padding='SAME')
+
+    w_n = K.minimum(w, 0.)
+    b_n = K.minimum(b, 0.)
+    z_n = K.conv2d(a, kernel=w_n, strides=strides[1:-1], padding='same') + b_n - self.epsilon
+    s_n = r / z_n
+    c_n = conv2d_backprop_input(K.shape(a), w_n, s_n, strides, padding='SAME')
+
+    return a * (self.alpha * c_p + self.beta * c_n)
+
+  def predict_labels(self, images):
+    return predict_labels(self.model, images)
+
+  def run_lrp(self, images):
+    print("Running LRP on {0} images...".format(len(images)))
+    return self.lrp_runner([images, ])[0]
+
+  def compute_heatmaps(self, images, g=0.2, cmap_type='rainbow', **kwargs):
+    lrps = self.run_lrp(images)
+    print("LRP run successfully...")
+    gammas = get_gammas(lrps, g=g, **kwargs)
+    print("Gamma Correction completed...")
+    heatmaps = get_heatmaps(gammas, cmap_type=cmap_type, **kwargs)
+    return heatmaps
 
 
 # -------  Début Partie Grad-Cam    ------ #
@@ -474,10 +508,9 @@ class LimeImageExplainer(object):
         if random_seed is None:
             random_seed = self.random_state.randint(0, high=1000)
 
-
-        segments = segmentation.quickshift(image, kernel_size=4,
-                                                    max_dist=200, ratio=0.2,
-                                                    random_seed=random_seed)
+        if segmentation_fn is None :
+            segmentation_fn = segmentation.quickshift
+        segments = segmentation_fn(image)
 
         fudged_image = image.copy()
         if hide_color is None:

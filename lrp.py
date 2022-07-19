@@ -1,200 +1,139 @@
-"""Class that implements the layer-wise relevance propagation algorithm.
-"""
+import sys
 
-import numpy as np
-import tensorflow as tf
-import tensorflow.keras.backend as K
-from tensorflow.python.ops import gen_nn_ops
-from tensorflow.keras.applications.vgg16 import preprocess_input
+from keras                        import backend as K
+from tensorflow.python.ops        import gen_nn_ops
+from tools.lrp_utils                        import (get_model_params, 
+                                          get_gammas, 
+                                          get_heatmaps, 
+                                          load_images,
+                                          predict_labels, 
+                                          visualize_heatmap)
 
 
-class RelevancePropagation(object):
-    """Very basic implementation of the layer-wise relevance propagation algorithm.
-    """
+class LayerwiseRelevancePropagation:
 
-    def __init__(self, conf):
-        self.epsilon = conf["lrp"]["epsilon"]
-        self.rule = conf["lrp"]["rule"]
-        self.pooling_type = conf["lrp"]["pooling_type"]
-        self.grayscale = conf["lrp"]["grayscale"]
+  def __init__(self,img_dir, results_dir, model = None, model_name='vgg16', alpha=2, epsilon=1e-7):
 
-        # Load model
-        input_shape = (conf["image"]["height"], conf["image"]["width"], conf["image"]["channels"])
-        network = conf["model"]["name"]
-        weights = conf["model"]["weights"]
+    if model is None:
+      model_name = model_name.lower()
+      if model_name == 'vgg16':
+        model_type = VGG16
+      elif model_name == 'vgg19':
+        model_type = VGG19
+      else:
+        raise 'Model name not one of VGG16 or VGG19'
+        sys.exit()
+      self.model = model_type(include_top=True, weights='imagenet', input_shape=(224, 224, 3))
+    else:
+      self.model = model
+    self.alpha = alpha
+    self.beta = 1 - alpha
+    self.epsilon = epsilon
 
-        if network == "vgg16":
-            self.model = tf.keras.applications.VGG16(input_shape=input_shape, weights=weights)
-        elif network == "vgg19":
-            self.model = tf.keras.applications.VGG19(input_shape=input_shape, weights=weights)
-        else:
-            raise Exception("Error: Unknown network name.")
+    self.names, self.activations, self.weights = get_model_params(self.model)
+    self.num_layers = len(self.names)
 
-        # Extract model's weights
-        self.weights = {weight.name.split('/')[0]: weight for weight in self.model.trainable_weights
-                        if 'bias' not in weight.name}
+    self.relevance = self.compute_relevances()
+    self.lrp_runner = K.function(inputs=[self.model.input, ], outputs=[self.relevance, ])
 
-        # Extract activation layers
-        self.activations = [layer.output for layer in self.model.layers]
-        self.activations = self.activations[::-1]
+  def compute_relevances(self):
+    r = self.model.output
+    for i in range(self.num_layers-2, -1, -1):
+      if 'fc' in self.names[i + 1]:
+        r = self.backprop_fc(self.weights[i + 1][0], self.weights[i + 1][1], self.activations[i], r)
+      elif 'flatten' in self.names[i + 1]:
+        r = self.backprop_flatten(self.activations[i], r)
+      elif 'pool' in self.names[i + 1]:
+        r = self.backprop_max_pool2d(self.activations[i], r)
+      elif 'conv' in self.names[i + 1]:
+        r = self.backprop_conv2d(self.weights[i + 1][0], self.weights[i + 1][1], self.activations[i], r)
+      else:
+        raise 'Layer not recognized!'
+        sys.exit()
+    return r
 
-        # Extract the model's layers name
-        self.layer_names = [layer.name for layer in self.model.layers]
-        self.layer_names = self.layer_names[::-1]
+  def backprop_fc(self, w, b, a, r):
+    w_p = K.maximum(w, 0.)
+    b_p = K.maximum(b, 0.)
+    z_p = K.dot(a, w_p) + b_p + self.epsilon
+    s_p = r / z_p
+    c_p = K.dot(s_p, K.transpose(w_p))
+    
+    w_n = K.minimum(w, 0.)
+    b_n = K.minimum(b, 0.)
+    z_n = K.dot(a, w_n) + b_n - self.epsilon
+    s_n = r / z_n
+    c_n = K.dot(s_n, K.transpose(w_n))
 
-        # Build relevance graph
-        self.relevance = self.relevance_propagation()
+    return a * (self.alpha * c_p + self.beta * c_n)
 
-    def run(self, image):
-        """Computes feature relevance maps for a single image.
+  def backprop_flatten(self, a, r):
+    shape = a.get_shape().as_list()
+    shape[0] = -1
+    return K.reshape(r, shape)
 
-        Args:
-            image: array of shape (W, H, C)
+  def backprop_max_pool2d(self, a, r, ksize=(1, 2, 2, 1), strides=(1, 2, 2, 1)):
+    z = K.pool2d(a, pool_size=ksize[1:-1], strides=strides[1:-1], padding='valid', pool_mode='max')
 
-        Returns:
-            RGB or grayscale relevance map.
+    z_p = K.maximum(z, 0.) + self.epsilon
+    s_p = r / z_p
+    c_p = gen_nn_ops.max_pool_grad_v2(a, z_p, s_p, ksize, strides, padding='VALID')
 
-        """
-        f = K.function(inputs=self.model.input, outputs=self.relevance)
-        image = preprocess_input(image)
-        image = tf.expand_dims(image, axis=0)
-        relevance_scores = f(inputs=image)
-        relevance_scores = self.postprocess(relevance_scores)
-        return np.squeeze(relevance_scores)
+    z_n = K.minimum(z, 0.) - self.epsilon
+    s_n = r / z_n
+    c_n = gen_nn_ops.max_pool_grad_v2(a, z_n, s_n, ksize, strides, padding='VALID')
 
-    def relevance_propagation(self):
-        """Builds graph for relevance propagation."""
-        relevance = self.model.output
-        for i, layer_name in enumerate(self.layer_names):
-            if 'prediction' in layer_name:
-                relevance = self.relprop_dense(self.activations[i+1], self.weights[layer_name], relevance)
-            elif 'fc' in layer_name:
-                relevance = self.relprop_dense(self.activations[i+1], self.weights[layer_name], relevance)
-            elif 'flatten' in layer_name:
-                relevance = self.relprop_flatten(self.activations[i+1], relevance)
-            elif 'pool' in layer_name:
-                relevance = self.relprop_pool(self.activations[i+1], relevance)
-            elif 'conv' in layer_name:
-                relevance = self.relprop_conv(self.activations[i+1], self.weights[layer_name], relevance, layer_name)
-            elif 'input' in layer_name:
-                pass
-            else:
-                raise Exception("Error: layer type not recognized.")
-        return relevance
+    return a * (self.alpha * c_p + self.beta * c_n)
 
-    def relprop_dense(self, x, w, r):
-        """Implements relevance propagation rules for dense layers.
+  def backprop_conv2d(self, w, b, a, r, strides=(1, 1, 1, 1)):
+    w_p = K.maximum(w, 0.)
+    b_p = K.maximum(b, 0.)
+    z_p = K.conv2d(a, kernel=w_p, strides=strides[1:-1], padding='same') + b_p + self.epsilon
+    s_p = r / z_p
+    c_p = K.tf.nn.conv2d_backprop_input(K.shape(a), w_p, s_p, strides, padding='SAME')
 
-        Args:
-            x: array of activations
-            w: array of weights
-            r: array of relevance scores
+    w_n = K.minimum(w, 0.)
+    b_n = K.minimum(b, 0.)
+    z_n = K.conv2d(a, kernel=w_n, strides=strides[1:-1], padding='same') + b_n - self.epsilon
+    s_n = r / z_n
+    c_n = K.tf.nn.conv2d_backprop_input(K.shape(a), w_n, s_n, strides, padding='SAME')
 
-        Returns:
-            array of relevance scores of same dimension as a
+    return a * (self.alpha * c_p + self.beta * c_n)
 
-        """
-        if self.rule == "z_plus":
-            w_pos = tf.maximum(w, 0.0)
-            z = tf.matmul(x, w_pos) + self.epsilon
-            s = r / z
-            c = tf.matmul(s, tf.transpose(w_pos))
-            return c * x
-        else:
-            raise Exception("Error: rule for dense layer not implemented.")
+  def predict_labels(self, images):
+    return predict_labels(self.model, images)
 
-    def relprop_flatten(self, x, r):
-        """Transfers relevance scores coming from dense layers to last feature maps of network.
+  def run_lrp(self, images):
+    print("Running LRP on {0} images...".format(len(images)))
+    return self.lrp_runner([images, ])[0]
 
-        Args:
-            x: array of activations
-            r: array of relevance scores
+  def compute_heatmaps(self, images, g=0.2, cmap_type='rainbow', **kwargs):
+    lrps = self.run_lrp(images)
+    print("LRP run successfully...")
+    gammas = get_gammas(lrps, g=g, **kwargs)
+    print("Gamma Correction completed...")
+    heatmaps = get_heatmaps(gammas, cmap_type=cmap_type, **kwargs)
+    return heatmaps
 
-        Returns:
-            array of relevance scores of same dimension as a
+if __name__ == '__main__':
+  image_names = [
+    'banana.jpg'
+  ]
 
-        """
-        return tf.reshape(r, tf.shape(x))
+  image_names += sys.argv[1:]
 
-    def relprop_pool(self, x, r, ksize=(1, 2, 2, 1), strides=(1, 2, 2, 1), padding='SAME'):
-        """Implements relevance propagation through pooling layers.
+  image_paths = [images_dir + name for name in image_names]
+  image_names = [name.split('.')[0] for name in image_names]
 
-        Args:
-            x: array of activations
-            r: array of relevance scores
-            ksize: pooling kernel dimensions used during forward path
-            strides: step size of pooling kernel used during forward path
-            padding: parameter for SAME or VALID padding
+  num_images = len(image_names)
+  raw_images, processed_images = load_images(image_paths)
+  print("Images loaded...")
 
-        Returns:
-            array of relevance scores of same dimensions as a
+  lrp = LayerwiseRelevancePropagation()
+  labels = lrp.predict_labels(processed_images)
+  print("Labels predicted...")
+  heatmaps = lrp.compute_heatmaps(processed_images)
+  print("Heatmaps generated...")
 
-        """
-        if self.pooling_type == "avg":
-            z = tf.nn.avg_pool(x, ksize, strides, padding) + self.epsilon
-            s = r / z
-            c = gen_nn_ops.avg_pool_grad(tf.shape(x), s, ksize, strides, padding)
-        elif self.pooling_type == "max":
-            z = tf.nn.max_pool(x, ksize, strides, padding) + self.epsilon
-            s = r / z
-            c = gen_nn_ops.max_pool_grad_v2(x, z, s, ksize, strides, padding)
-        else:
-            raise Exception("Error: no such unpooling operation implemented.")
-        return c * x
-
-    def relprop_conv(self, x, w, r, name, strides=(1, 1, 1, 1), padding='SAME'):
-        """Implements relevance propagation rules for convolutional layers.
-
-        Args:
-            x: array of activations
-            w: array of weights
-            r: array of relevance scores
-            name: current layer name
-            strides: step size of filters used during forward path
-            padding: parameter for SAME or VALID padding
-
-        Returns:
-            array of relevance scores of same dimensions as a
-
-        """
-        if name == 'block1_conv1':
-            x = tf.ones_like(x)     # only for input
-
-        if self.rule == "z_plus":
-            w_pos = tf.maximum(w, 0.0)
-            z = tf.nn.conv2d(x, w_pos, strides, padding) + self.epsilon
-            s = r / z
-            c = tf.compat.v1.nn.conv2d_backprop_input(tf.shape(x), w_pos, s, strides, padding)
-            return c * x
-        else:
-            raise Exception("Error: rule for convolutional layer not implemented.")
-
-    @staticmethod
-    def rescale(x):
-        """Rescales relevance scores of a batch of relevance maps between 0 and 1
-
-        Args:
-            x: RGB or grayscale relevance maps with dimensions (N, W, H, C) or (N, W, H), respectively.
-
-        Returns:
-            Rescaled relevance maps of same dimensions as input
-
-        """
-        x_min = np.min(x, axis=(1, 2), keepdims=True)
-        x_max = np.max(x, axis=(1, 2), keepdims=True)
-        return (x - x_min).astype("float64") / (x_max - x_min).astype("float64")
-
-    def postprocess(self, x):
-        """Postprocesses batch of feature relevance scores (relevance_maps).
-
-        Args:
-            x: array with dimension (N, W, H, C)
-
-        Returns:
-            x: array with dimensions (N, W, H, C) or (N, W, H) depending on if grayscale or not
-
-        """
-        if self.grayscale:
-            x = np.mean(x, axis=-1)
-        x = self.rescale(x)
-        return x
+  for img, hmap, label, name in zip(raw_images, heatmaps, labels, image_names):
+    visualize_heatmap(img, hmap, label, results_dir + name + '.jpg')
