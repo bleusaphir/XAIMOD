@@ -143,6 +143,7 @@ class LayerwiseRelevancePropagation:
     gammas = get_gammas(lrps, g=g, **kwargs)
     print("Gamma Correction completed...")
     heatmaps = get_heatmaps(gammas, cmap_type=cmap_type, **kwargs)
+    cv2.imshow(heatmaps[0])
     return heatmaps
 
 
